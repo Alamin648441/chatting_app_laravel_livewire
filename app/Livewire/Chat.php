@@ -7,6 +7,7 @@ use App\Models\User;
 use Livewire\Component;
 use Livewire\WithFileUploads;
 use Illuminate\Support\Str;
+use App\Events\MessageSent;
 
 class Chat extends Component
 {
@@ -24,7 +25,10 @@ class Chat extends Component
     {
         $this->users = User::whereNot('id', auth()->id())->get();
         $this->selectedUser = $this->users->first();
-        $this->loadMessage();
+        
+        if ($this->selectedUser) {
+            $this->loadMessage();
+        }
     }
 
     public function selectUser($userId)
@@ -38,6 +42,7 @@ class Chat extends Component
 
     public function sendMessage()
     {
+        // Validation
         if (!$this->newMessage && !$this->attachment) return;
 
         $data = [
@@ -46,7 +51,7 @@ class Chat extends Component
             'message' => $this->newMessage ?? '',
         ];
 
-        // Reply to message
+        // Reply
         if ($this->replyingTo) {
             $data['reply_to_id'] = $this->replyingTo->id;
         }
@@ -59,10 +64,19 @@ class Chat extends Component
             $data['file_size'] = round($this->attachment->getSize() / 1024, 2) . ' KB';
         }
 
+        // Create message
         $message = ChatMessage::create($data);
-        $this->messages[] = $message;
-
+        
+        // Broadcast event to receiver (real-time)
+        broadcast(new MessageSent($message))->toOthers();
+        
+        // Add to local messages
+        $this->messages->push($message);
+        
+        // Reset inputs
         $this->reset(['newMessage', 'attachment', 'replyingTo']);
+        
+        // Scroll to bottom
         $this->dispatch('scrollToBottom');
     }
 
@@ -83,9 +97,15 @@ class Chat extends Component
 
     public function editMessage($messageId)
     {
-        // Edit logic
-        $message = ChatMessage::find($messageId);
-        $this->newMessage = $message->message;
+        $message = ChatMessage::where('id', $messageId)
+            ->where('sender_id', auth()->id())
+            ->first();
+        
+        if ($message) {
+            $this->newMessage = $message->message;
+            // Optional: Store editing message ID for update
+            $this->dispatch('editingMessage', messageId: $messageId);
+        }
     }
 
     public function deleteMessage($messageId)
@@ -95,19 +115,36 @@ class Chat extends Component
             ->delete();
 
         $this->loadMessage();
+        
+        // Notify other user
+        $this->dispatch('messageDeleted');
     }
 
     public function unsendMessage($messageId)
     {
-        ChatMessage::where('id', $messageId)
+        $message = ChatMessage::where('id', $messageId)
             ->where('sender_id', auth()->id())
-            ->update(['message' => 'This message was deleted']);
-
-        $this->loadMessage();
+            ->first();
+        
+        if ($message) {
+            $message->update([
+                'message' => 'This message was unsent.',
+                'file_path' => null,
+                'file_name' => null,
+                'file_size' => null,
+            ]);
+            
+            $this->loadMessage();
+            
+            // Broadcast unsend event
+            broadcast(new MessageSent($message))->toOthers();
+        }
     }
 
     public function loadMessage()
     {
+        if (!$this->selectedUser) return;
+        
         $this->messages = ChatMessage::query()
             ->with(['sender', 'receiver', 'replyTo.sender'])
             ->where(function ($query) {

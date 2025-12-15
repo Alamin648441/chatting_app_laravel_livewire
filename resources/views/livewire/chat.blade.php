@@ -218,7 +218,7 @@
             white-space: pre-wrap;
         }
 
-        /* Message Meta (Time + Status) */
+        /* Message Meta */
         .msg-meta {
             display: flex;
             align-items: center;
@@ -250,6 +250,26 @@
 
         .tick-read {
             color: #53bdeb;
+        }
+
+        /* Reply Preview */
+        .reply-preview {
+            background: #182229;
+            border-left: 4px solid #00a884;
+            padding: 8px 12px;
+            margin-bottom: 6px;
+            border-radius: 4px;
+            font-size: 13px;
+        }
+
+        .reply-preview-header {
+            color: #00a884;
+            font-weight: 500;
+            margin-bottom: 2px;
+        }
+
+        .reply-preview-text {
+            color: rgba(255, 255, 255, 0.7);
         }
 
         /* File Attachment */
@@ -332,26 +352,6 @@
             font-size: 18px;
             width: 20px;
             text-align: center;
-        }
-
-        /* Reply Preview */
-        .reply-preview {
-            background: #182229;
-            border-left: 4px solid #00a884;
-            padding: 8px 12px;
-            margin-bottom: 6px;
-            border-radius: 4px;
-            font-size: 13px;
-        }
-
-        .reply-preview-header {
-            color: #00a884;
-            font-weight: 500;
-            margin-bottom: 2px;
-        }
-
-        .reply-preview-text {
-            color: rgba(255, 255, 255, 0.7);
         }
 
         /* File Preview in Footer */
@@ -539,9 +539,7 @@
             </div>
 
             <!-- Messages -->
-            <div class="messenger-body"
-                id="messageBody"
-                x-data="{ 
+            <div class="messenger-body" id="messageBody" x-data="{ 
                     contextMenu: { show: false, x: 0, y: 0, messageId: null },
                     scrollToEnd() { 
                         this.$el.scrollTop = this.$el.scrollHeight; 
@@ -558,17 +556,13 @@
                     hideMenu() {
                         this.contextMenu.show = false;
                     }
-                }"
-                x-init="$nextTick(() => scrollToEnd())"
-                @click="hideMenu()"
-                wire:poll.keep-alive>
+                }" x-init="$nextTick(() => scrollToEnd())" @click="hideMenu()">
 
                 @foreach($messages as $message)
                 <div class="msg-container {{ $message->sender_id === auth()->id() ? 'outgoing' : 'incoming' }}">
                     <div class="msg {{ $message->sender_id === auth()->id() ? 'outgoing' : 'incoming' }}"
-                        @contextmenu="showMenu($event, {{ $message->id }})">
-
-                        <!-- Reply Preview (if exists) -->
+                         @contextmenu="showMenu($event, {{ $message->id }})">
+                        
                         @if(isset($message->reply_to))
                         <div class="reply-preview">
                             <div class="reply-preview-header">{{ $message->reply_to->sender->name ?? 'User' }}</div>
@@ -576,7 +570,6 @@
                         </div>
                         @endif
 
-                        <!-- File Attachment (if exists) -->
                         @if(isset($message->file_path))
                         <div class="file-attachment">
                             <div class="file-icon">📄</div>
@@ -587,63 +580,59 @@
                         </div>
                         @endif
 
-                        <!-- Message Text -->
                         @if($message->message)
                         <div class="msg-text">{{ $message->message }}</div>
                         @endif
 
-                        <!-- Message Meta -->
                         <div class="msg-meta">
                             <span class="msg-time">{{ \Carbon\Carbon::parse($message->created_at)->format('H:i') }}</span>
-
-                            <!-- Status Ticks (only for outgoing) -->
+                            
                             @if($message->sender_id === auth()->id())
-                            <span class="msg-status">
-                                @if(isset($message->read_at))
-                                <span class="tick-read">✓✓</span>
-                                @elseif(isset($message->delivered_at))
-                                <span class="tick-delivered">✓✓</span>
-                                @else
-                                <span class="tick-sent">✓</span>
-                                @endif
-                            </span>
+                                <span class="msg-status">
+                                    @if(isset($message->read_at))
+                                        <span class="tick-read">✓✓</span>
+                                    @elseif(isset($message->delivered_at))
+                                        <span class="tick-delivered">✓✓</span>
+                                    @else
+                                        <span class="tick-sent">✓</span>
+                                    @endif
+                                </span>
                             @endif
                         </div>
                     </div>
                 </div>
 
-                <!-- Context Menu -->
                 <div class="context-menu"
-                    :class="{ 'show': contextMenu.show && contextMenu.messageId === {{ $message->id }} }"
-                    :style="{ top: contextMenu.y + 'px', left: contextMenu.x + 'px' }">
-
+                     :class="{ 'show': contextMenu.show && contextMenu.messageId === {{ $message->id }} }"
+                     :style="{ top: contextMenu.y + 'px', left: contextMenu.x + 'px' }">
+                    
                     @if($message->sender_id === auth()->id())
-                    <div class="context-menu-item"
-                        @click="hideMenu()"
-                        wire:click="editMessage({{ $message->id }})">
+                    <div class="context-menu-item" 
+                         @click="hideMenu()"
+                         wire:click="editMessage({{ $message->id }})">
                         <span class="menu-icon">✏️</span>
                         <span>Edit</span>
                     </div>
                     @endif
 
                     <div class="context-menu-item"
-                        @click="hideMenu()"
-                        wire:click="replyMessage({{ $message->id }})">
+                         @click="hideMenu()"
+                         wire:click="replyMessage({{ $message->id }})">
                         <span class="menu-icon">↩️</span>
                         <span>Reply</span>
                     </div>
 
                     @if($message->sender_id === auth()->id())
                     <div class="context-menu-item danger"
-                        @click="hideMenu()"
-                        wire:click="deleteMessage({{ $message->id }})">
+                         @click="hideMenu()"
+                         wire:click="deleteMessage({{ $message->id }})">
                         <span class="menu-icon">🗑️</span>
                         <span>Delete</span>
                     </div>
 
                     <div class="context-menu-item danger"
-                        @click="hideMenu()"
-                        wire:click="unsendMessage({{ $message->id }})">
+                         @click="hideMenu()"
+                         wire:click="unsendMessage({{ $message->id }})">
                         <span class="menu-icon">↶</span>
                         <span>Unsend</span>
                     </div>
@@ -654,7 +643,6 @@
 
             <!-- Footer -->
             <div class="messenger-footer-wrapper">
-                <!-- File Preview (if file selected) -->
                 @if($attachment)
                 <div class="file-preview-container">
                     <div class="file-preview-info">
@@ -668,7 +656,6 @@
                 </div>
                 @endif
 
-                <!-- Reply Preview (if replying) -->
                 @if($replyingTo)
                 <div class="file-preview-container">
                     <div class="file-preview-info">
@@ -683,37 +670,44 @@
                 @endif
 
                 <div class="messenger-footer">
-                    <!-- File Attach Button -->
-                    <label for="fileInput" class="attach-btn" title="Attach file">
-                        📎
-                    </label>
-                    <input type="file" id="fileInput" wire:model="attachment">
+                <label for="fileInput" class="attach-btn" title="Attach file">
+                    📎
+                </label>
+                <input type="file" id="fileInput" wire:model="attachment">
 
-                    <div class="input-wrapper">
-                        <input
-                            type="text"
-                            placeholder="Type a message"
-                            wire:model="newMessage"
-                            wire:keydown.enter="sendMessage"
-                            @keydown.enter="setTimeout(() => $el.closest('.messenger-container').querySelector('.messenger-body').scrollTop = $el.closest('.messenger-container').querySelector('.messenger-body').scrollHeight, 100)">
-                    </div>
-
-                    <button class="send-btn"
-                        wire:click="sendMessage"
-                        @click="setTimeout(() => document.getElementById('messageBody').scrollTop = document.getElementById('messageBody').scrollHeight, 100)">
-                        ➤
-                    </button>
+                <div class="input-wrapper">
+                    <input
+                        type="text"
+                        placeholder="Type a message"
+                        wire:model="newMessage"
+                        wire:keydown.enter="sendMessage">
                 </div>
+
+                <button class="send-btn" 
+                        wire:click="sendMessage">
+                    ➤
+                </button>
+            </div>
             </div>
         </div>
     </div>
 
     <script>
         document.addEventListener('livewire:initialized', () => {
+            console.log('✅ Script initialized');
             scrollToBottom();
-            Livewire.on('scrollToBottom', () => {
-                setTimeout(() => scrollToBottom(), 100);
-            });
+            
+            const userId = {{ auth()->id() }};
+            console.log('👤 User ID:', userId);
+            
+            Echo.private(`chat.${userId}`)
+                .listen('.message.sent', (e) => {
+                    console.log('✅ Message received:', e);
+                    window.Livewire.find('{{ $_instance->getId() }}').call('loadMessage');
+                    setTimeout(() => scrollToBottom(), 200);
+                });
+            
+            console.log('🎧 Listening on channel: chat.' + userId);
         });
 
         function scrollToBottom() {
@@ -722,11 +716,5 @@
                 messageBody.scrollTop = messageBody.scrollHeight;
             }
         }
-
-        // Hide context menu on scroll
-        document.getElementById('messageBody')?.addEventListener('scroll', function() {
-            const menus = document.querySelectorAll('.context-menu');
-            menus.forEach(menu => menu.classList.remove('show'));
-        });
     </script>
 </div>

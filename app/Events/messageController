@@ -1,0 +1,497 @@
+<?php
+
+namespace App\Http\Controllers\Api\Chats;
+
+use App\Events\MessageSent;
+use App\Http\Controllers\Controller;
+use App\Models\ChatMessage;
+use App\Models\User;
+use App\Traits\ApiResponse;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Facades\Validator;
+
+class ChatController extends Controller
+{
+    use ApiResponse;
+
+    /**
+     * Get users who have chatted with current user
+     */
+    public function users(Request $request)
+    {
+        try {
+            $currentUserId = Auth::id();
+            $cacheKey = "chat_users_{$currentUserId}";
+            $cacheTime = 60; // 1 minute cache
+            
+            // Use cache for better performance
+            $users = Cache::remember($cacheKey, $cacheTime, function() use ($currentUserId) {
+                // Get distinct user IDs who have chatted with current user
+                $chattedUserIds = ChatMessage::where(function($query) use ($currentUserId) {
+                        $query->where('sender_id', $currentUserId)
+                              ->orWhere('receiver_id', $currentUserId);
+                    })
+                    ->selectRaw('DISTINCT CASE 
+                        WHEN sender_id = ? THEN receiver_id 
+                        ELSE sender_id 
+                    END as other_user_id', [$currentUserId])
+                    ->whereRaw('CASE 
+                        WHEN sender_id = ? THEN receiver_id 
+                        ELSE sender_id 
+                    END != ?', [$currentUserId, $currentUserId])
+                    ->pluck('other_user_id');
+                
+                // Get users with unread message count
+                return User::whereIn('id', $chattedUserIds)
+                    ->select('id', 'name', 'email', 'profile_image', 'created_at')
+                    ->withCount(['unreadMessages' => function($query) use ($currentUserId) {
+                        $query->where('receiver_id', $currentUserId)
+                              ->whereNull('read_at');
+                    }])
+                    ->with(['latestMessage' => function($query) use ($currentUserId) {
+                        $query->where(function($q) use ($currentUserId) {
+                            $q->where('sender_id', $currentUserId)
+                              ->orWhere('receiver_id', $currentUserId);
+                        })
+                        ->orderBy('created_at', 'desc')
+                        ->limit(1);
+                    }])
+                    ->orderByDesc(function($query) use ($currentUserId) {
+                        $query->select('created_at')
+                            ->from('chat_messages')
+                            ->whereColumn(function($q) use ($currentUserId) {
+                                $q->whereColumn('sender_id', 'users.id')
+                                  ->where('receiver_id', $currentUserId);
+                            })
+                            ->orWhere(function($q) use ($currentUserId) {
+                                $q->whereColumn('receiver_id', 'users.id')
+                                  ->where('sender_id', $currentUserId);
+                            })
+                            ->orderBy('created_at', 'desc')
+                            ->limit(1);
+                    })
+                    ->get();
+            });
+
+            return $this->success($users, 'Users retrieved successfully', 200);
+        } catch (\Exception $e) {
+            return $this->error([], $e->getMessage(), 500);
+        }
+    }
+
+    /**
+     * Get messages between current user and another user
+     */
+    public function messages(Request $request, $userId)
+    {
+        try {
+            // Validate user ID
+            if (!User::where('id', $userId)->exists()) {
+                return $this->error([], 'User not found', 404);
+            }
+
+            $currentUserId = Auth::id();
+            $perPage = $request->get('per_page', 50);
+            
+            // Get messages with pagination
+            $messages = ChatMessage::with(['sender:id,name,email,profile_image', 'receiver:id,name,email,profile_image'])
+                ->where(function ($query) use ($currentUserId, $userId) {
+                    $query->where('sender_id', $currentUserId)
+                        ->where('receiver_id', $userId);
+                })
+                ->orWhere(function ($query) use ($currentUserId, $userId) {
+                    $query->where('sender_id', $userId)
+                        ->where('receiver_id', $currentUserId);
+                })
+                ->orderBy('created_at', 'desc')
+                ->paginate($perPage);
+            
+            // Mark messages as read
+            ChatMessage::where('sender_id', $userId)
+                ->where('receiver_id', $currentUserId)
+                ->whereNull('read_at')
+                ->update(['read_at' => now()]);
+                
+            // Clear cache for both users
+            Cache::forget("chat_users_{$currentUserId}");
+            Cache::forget("chat_users_{$userId}");
+
+            return $this->success([
+                'messages' => $messages->items(),
+                'pagination' => [
+                    'current_page' => $messages->currentPage(),
+                    'last_page' => $messages->lastPage(),
+                    'per_page' => $messages->perPage(),
+                    'total' => $messages->total(),
+                    'has_more_pages' => $messages->hasMorePages(),
+                ]
+            ], 'Messages retrieved successfully', 200);
+        } catch (\Exception $e) {
+            return $this->error([], $e->getMessage(), 500);
+        }
+    }
+
+    /**
+     * Send a message
+     */
+    public function send(Request $request)
+    {
+        try {
+            $validator = Validator::make($request->all(), [
+                'receiver_id' => 'required|exists:users,id',
+                'message' => 'nullable|string|max:5000',
+                'file' => 'nullable|file|max:10240|mimes:jpg,jpeg,png,gif,pdf,doc,docx,txt,mp3,mp4,wav',
+            ]);
+
+            if ($validator->fails()) {
+                return $this->error($validator->errors(), 'Validation failed', 422);
+            }
+
+            $currentUserId = Auth::id();
+            $receiverId = $request->receiver_id;
+
+            // Check if user is trying to send message to themselves
+            if ($currentUserId == $receiverId) {
+                return $this->error([], 'You cannot send message to yourself', 400);
+            }
+
+            // Check if receiver exists
+            $receiver = User::find($receiverId);
+            if (!$receiver) {
+                return $this->error([], 'Receiver not found', 404);
+            }
+
+            // Check if message or file is provided
+            if (empty($request->message) && !$request->hasFile('file')) {
+                return $this->error([], 'Message or file is required', 400);
+            }
+
+            $data = [
+                'sender_id' => $currentUserId,
+                'receiver_id' => $receiverId,
+                'message' => $request->message ?? '',
+            ];
+
+            // Handle file upload
+            if ($request->hasFile('file')) {
+                $file = $request->file('file');
+                
+                // Generate unique filename
+                $filename = time() . '_' . uniqid() . '.' . $file->getClientOriginalExtension();
+                $path = $file->storeAs('chat-files', $filename, 'public');
+                
+                $data['file_path'] = $path;
+                $data['file_name'] = $file->getClientOriginalName();
+                $data['file_size'] = $file->getSize();
+                $data['file_type'] = $file->getMimeType();
+            }
+
+            // Create message
+            $message = ChatMessage::create($data);
+            
+            // Load relationships
+            $message->load(['sender:id,name,email,profile_image', 'receiver:id,name,email,profile_image']);
+
+            // Clear cache for both users
+            Cache::forget("chat_users_{$currentUserId}");
+            Cache::forget("chat_users_{$receiverId}");
+
+            // Broadcast event
+            broadcast(new MessageSent($message))->toOthers();
+
+            return $this->success($message, 'Message sent successfully', 201);
+        } catch (\Exception $e) {
+            return $this->error([], $e->getMessage(), 500);
+        }
+    }
+
+    /**
+     * Delete a message permanently
+     */
+    public function delete(Request $request, $id)
+    {
+        try {
+            $message = ChatMessage::where('id', $id)
+                ->where('sender_id', $request->user()->id)
+                ->first();
+
+            if (!$message) {
+                return $this->error([], 'Message not found or unauthorized', 404);
+            }
+
+            // Delete file if exists
+            if ($message->file_path && Storage::disk('public')->exists($message->file_path)) {
+                Storage::disk('public')->delete($message->file_path);
+            }
+
+            $message->delete();
+
+            // Clear cache for both users
+            Cache::forget("chat_users_{$message->sender_id}");
+            Cache::forget("chat_users_{$message->receiver_id}");
+
+            return $this->success([], 'Message deleted successfully', 200);
+        } catch (\Exception $e) {
+            return $this->error([], $e->getMessage(), 500);
+        }
+    }
+
+    /**
+     * Unsend/Delete for everyone
+     */
+    public function unsend(Request $request, $id)
+    {
+        try {
+            $message = ChatMessage::where('id', $id)
+                ->where('sender_id', $request->user()->id)
+                ->first();
+
+            if (!$message) {
+                return $this->error([], 'Message not found or unauthorized', 404);
+            }
+
+            // Delete file if exists
+            if ($message->file_path && Storage::disk('public')->exists($message->file_path)) {
+                Storage::disk('public')->delete($message->file_path);
+            }
+
+            $message->update([
+                'message' => 'This message was deleted',
+                'file_path' => null,
+                'file_name' => null,
+                'file_size' => null,
+                'file_type' => null,
+                'is_deleted' => true,
+            ]);
+
+            $message->load(['sender:id,name,email,profile_image', 'receiver:id,name,email,profile_image']);
+
+            // Clear cache for both users
+            Cache::forget("chat_users_{$message->sender_id}");
+            Cache::forget("chat_users_{$message->receiver_id}");
+
+            // Broadcast event
+            broadcast(new MessageSent($message))->toOthers();
+
+            return $this->success([], 'Message unsent successfully', 200);
+        } catch (\Exception $e) {
+            return $this->error([], $e->getMessage(), 500);
+        }
+    }
+
+    /**
+     * Mark messages as read
+     */
+    public function markAsRead(Request $request, $userId)
+    {
+        try {
+            $currentUserId = Auth::id();
+            
+            $updated = ChatMessage::where('sender_id', $userId)
+                ->where('receiver_id', $currentUserId)
+                ->whereNull('read_at')
+                ->update(['read_at' => now()]);
+
+            // Clear cache
+            Cache::forget("chat_users_{$currentUserId}");
+            Cache::forget("chat_users_{$userId}");
+
+            return $this->success(['updated_count' => $updated], 'Messages marked as read', 200);
+        } catch (\Exception $e) {
+            return $this->error([], $e->getMessage(), 500);
+        }
+    }
+
+    /**
+     * Get unread message count
+     */
+    public function unreadCount(Request $request)
+    {
+        try {
+            $currentUserId = Auth::id();
+            
+            $count = ChatMessage::where('receiver_id', $currentUserId)
+                ->whereNull('read_at')
+                ->count();
+
+            return $this->success(['unread_count' => $count], 'Unread count retrieved', 200);
+        } catch (\Exception $e) {
+            return $this->error([], $e->getMessage(), 500);
+        }
+    }
+
+    /**
+     * Search users for chat
+     */
+    public function searchUsers(Request $request)
+    {
+        try {
+            $search = $request->get('search', '');
+            $currentUserId = Auth::id();
+            
+            if (empty($search)) {
+                return $this->error([], 'Search term is required', 400);
+            }
+
+            $users = User::where('id', '!=', $currentUserId)
+                ->where(function($query) use ($search) {
+                    $query->where('name', 'like', "%{$search}%")
+                          ->orWhere('email', 'like', "%{$search}%");
+                })
+                ->select('id', 'name', 'email', 'profile_image', 'created_at')
+                ->limit(20)
+                ->get();
+
+            return $this->success($users, 'Users found', 200);
+        } catch (\Exception $e) {
+            return $this->error([], $e->getMessage(), 500);
+        }
+    }
+
+    /**
+     * Clear chat history with a user
+     */
+    public function clearChat(Request $request, $userId)
+    {
+        try {
+            $currentUserId = Auth::id();
+            
+            // Validate user exists
+            if (!User::where('id', $userId)->exists()) {
+                return $this->error([], 'User not found', 404);
+            }
+
+            // Delete all messages between users
+            $deleted = ChatMessage::where(function($query) use ($currentUserId, $userId) {
+                    $query->where('sender_id', $currentUserId)
+                        ->where('receiver_id', $userId);
+                })
+                ->orWhere(function($query) use ($currentUserId, $userId) {
+                    $query->where('sender_id', $userId)
+                        ->where('receiver_id', $currentUserId);
+                })
+                ->delete();
+
+            // Delete associated files
+            $files = ChatMessage::withTrashed()
+                ->where(function($query) use ($currentUserId, $userId) {
+                    $query->where('sender_id', $currentUserId)
+                        ->where('receiver_id', $userId);
+                })
+                ->orWhere(function($query) use ($currentUserId, $userId) {
+                    $query->where('sender_id', $userId)
+                        ->where('receiver_id', $currentUserId);
+                })
+                ->whereNotNull('file_path')
+                ->pluck('file_path');
+
+            foreach ($files as $file) {
+                if (Storage::disk('public')->exists($file)) {
+                    Storage::disk('public')->delete($file);
+                }
+            }
+
+            // Clear cache
+            Cache::forget("chat_users_{$currentUserId}");
+            Cache::forget("chat_users_{$userId}");
+
+            return $this->success(['deleted_count' => $deleted], 'Chat cleared successfully', 200);
+        } catch (\Exception $e) {
+            return $this->error([], $e->getMessage(), 500);
+        }
+    }
+
+    /**
+     * Download chat file
+     */
+    public function downloadFile($messageId)
+    {
+        try {
+            $message = ChatMessage::findOrFail($messageId);
+            $currentUserId = Auth::id();
+            
+            // Check if user has permission to download the file
+            if ($message->sender_id != $currentUserId && $message->receiver_id != $currentUserId) {
+                return $this->error([], 'Unauthorized to download this file', 403);
+            }
+
+            // Check if file exists
+            if (!$message->file_path || !Storage::disk('public')->exists($message->file_path)) {
+                return $this->error([], 'File not found', 404);
+            }
+
+            $filePath = storage_path('app/public/' . $message->file_path);
+            $fileName = $message->file_name ?: basename($message->file_path);
+
+            return response()->download($filePath, $fileName);
+        } catch (\Exception $e) {
+            return $this->error([], $e->getMessage(), 500);
+        }
+    }
+}
+
+
+
+
+Route::middleware('auth:sanctum')->prefix('chat')->group(function() {
+    Route::get('/users', [ChatController::class, 'users']);
+    Route::get('/messages/{userId}', [ChatController::class, 'messages']);
+    Route::post('/send', [ChatController::class, 'send']);
+    Route::delete('/delete/{id}', [ChatController::class, 'delete']);
+    Route::put('/unsend/{id}', [ChatController::class, 'unsend']);
+    Route::post('/mark-read/{userId}', [ChatController::class, 'markAsRead']);
+    Route::get('/unread-count', [ChatController::class, 'unreadCount']);
+    Route::get('/search-users', [ChatController::class, 'searchUsers']);
+    Route::delete('/clear-chat/{userId}', [ChatController::class, 'clearChat']);
+    Route::get('/download-file/{messageId}', [ChatController::class, 'downloadFile']);
+});
+
+
+
+
+// User Model-এ
+public function unreadMessages()
+{
+    return $this->hasMany(ChatMessage::class, 'receiver_id')
+        ->whereNull('read_at');
+}
+
+public function latestMessage()
+{
+    return $this->hasOne(ChatMessage::class, 'sender_id')
+        ->orWhere('receiver_id', $this->id)
+        ->orderBy('created_at', 'desc');
+}
+
+// ChatMessage Model-এ
+protected $fillable = [
+    'sender_id',
+    'receiver_id',
+    'message',
+    'file_path',
+    'file_name',
+    'file_size',
+    'file_type',
+    'read_at',
+    'is_deleted'
+];
+
+protected $casts = [
+    'read_at' => 'datetime',
+    'is_deleted' => 'boolean',
+    'file_size' => 'integer'
+];
+
+public function sender()
+{
+    return $this->belongsTo(User::class, 'sender_id');
+}
+
+public function receiver()
+{
+    return $this->belongsTo(User::class, 'receiver_id');
+}
